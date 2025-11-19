@@ -1,0 +1,23 @@
+baseURL = 'https://why1414.github.io/'
+languageCode = 'zh-cn'
+title = '后端架构师'
+theme = 'PaperMod'
+
+# 允许 HTML (有些图表需要)
+[markup.goldmark.renderer]
+  unsafe = true
+
+# 核心配置：确保图片使用相对路径
+relativeURLs = true
+canonifyURLs = false
+
+[params]
+  # 启用暗色模式
+  defaultTheme = "auto"
+  # 代码高亮样式
+  assets.disableHLJS = false
+  
+  # 首页显示的社交链接
+  [[params.socialIcons]]
+    name = "github"
+    url = "https://github.com/why1414"
