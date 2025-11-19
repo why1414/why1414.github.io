@@ -22,7 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      HUGO_VERSION: 0.120.4 # 建议指定一个较新的版本
+      HUGO_VERSION: 0.146.0 # 建议指定一个较新的版本
     steps:
       - name: Checkout
         uses: actions/checkout@v4
