@@ -1,6 +1,6 @@
 baseURL = 'https://why1414.github.io/'
 languageCode = 'zh-cn'
-title = '后端架构师'
+title = 'why1414'
 theme = 'PaperMod'
 
 # 允许 HTML (有些图表需要)
