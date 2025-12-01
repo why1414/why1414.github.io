@@ -179,206 +179,224 @@ Prometheus Server 从各个 Exporter 拉取指标数据后，存储在本地的�
 - **数据保留策略**：支持配置数据的保留时间（如 15 天），过期数据会被自动删除以节省存储空间。
 - **查询优化**：通过内存缓存、预计算等手段提升查询性能。
 
+### 时间序列数据模型
+
+时间序列数据（Time Series Data）由以下两部分组成：
+
+- **唯一标识（Identifier）**：由指标名称和可选的标签键值对组成。
+- **Samples**：实际的数据点，包含一个 float64 类型的值（v）与一个 int64 类型的毫秒级时间戳（t）。
+
+
+#### 时间序列的唯一标识
+
+一个时间序列由以下两部分唯一确定：
+
+```text
+metric_name + 完整的 labelSet
+```
+
+> 只要任意标签不同，即使 metric name 一样，也是新的 time series。这是 Prometheus 多维数据模型的关键特性。
+
+host=A                 → [1,3,4]
+core=0                 → [3]
+
+#### TSDB 内部组织结构
+
+**seriesID**
+
+每个唯一的 Identifier 会分配一个 seriesID，每条时间序列独立存储自己的 samples：
+
+```text
+(identifier) → [(t0,v0), (t1,v1), ...]
+```
+
+**postings（倒排索引）**
+
+用于快速查找符合 label 条件的 seriesID，支持高效的标签过滤与聚合：
+
+```text
+metric=cpu_usage → [1,2,3,4]
+host=A → [1,3,4]
+core=0 → [3]
+```
+
+查询时执行 postings 的交集，得到所需的 seriesIDs。
+
+host=A → [1,3,4]
+
+#### PromQL 查询与 TSDB 行为
+
+**按标签过滤**
+
+```promql
+cpu_usage{host="A"}
+```
+
+TSDB 执行 postings 交集：
+
+```text
+metric=cpu_usage → [1,2,3,4]
+host=A → [1,3,4]
+→ 匹配 [1,3,4]
+```
+
+**按维度聚合**
+
+```promql
+sum(cpu_usage{host="A"}) by (host)
+```
+
+TSDB 先获取所有匹配的 series（1/3/4），按时间戳对齐后求和。
+
+**复杂过滤**
+
+```promql
+http_requests_total{method="GET", status="200"}
+```
+
+执行 postings 交集后只匹配对应的 series。
+
+
+#### 关键要点与最佳实践
+
+- 相同 metric name + 不同 labels → 完全不同的 time series
+- TSDB 使用倒排索引（postings）加速标签查询
+- PromQL 聚合的三个关键步骤：
+        1. 获取所有匹配的 series
+        2. 按 timestamp 对齐
+        3. 计算聚合结果
+- 高基数问题：label 越多 → series 数量可能爆炸，影响性能与存储成本
+
 ### PromQL 查询语言
 
-pv计算，QPS计算，分位数计算等。
+#### 1. PromQL 的核心执行原则
 
+**原则一：函数先作用于每条时间序列**
 
+例如：
+
+```promql
+rate(http_requests_total[1m])
+```
+
+每个 instance / pod 的序列分别计算 QPS。
+
+**原则二：聚合函数（sum / avg / by）再把这些序列按 label 合并**
+
+例如：
+
+```promql
+sum(rate(http_requests_total[1m])) by (method)
+```
+
+先对每个实例执行 rate，再按 method 聚合。
+
+---
+
+#### 2. PV（页面访问量）
+
+**过去 5 分钟 PV（counter 增量）**
+
+```promql
+increase(http_requests_total[5m])
+```
+
+每条序列单独算 PV 增量（每个实例一条）。
+
+**总 PV**
+
+```promql
+sum(increase(http_requests_total[5m]))
+```
+
+所有实例的 PV 相加，得到全服务 PV。
+
+**按 path 聚合**
+
+```promql
+sum(increase(http_requests_total[5m])) by (path)
+```
+
+---
+
+#### 3. QPS（Queries Per Second）
+
+**每个实例的 QPS**
+
+```promql
+rate(http_requests_total[1m])
+```
+
+不加 sum 时，每条序列独立算 QPS（可用于排查实例负载）。
+
+**总 QPS**
+
+```promql
+sum(rate(http_requests_total[1m]))
+```
+
+先 rate，再 sum 聚合为一条序列。
+
+**按 method 聚合的 QPS**
+
+```promql
+sum(rate(http_requests_total[1m])) by (method)
+```
+
+---
+
+#### 4. P80 耗时（Histogram）
+
+原始指标：`request_duration_seconds_bucket{le="0.1", ...}`
+
+**每实例自己的 P80**
+
+```promql
+histogram_quantile(0.80,
+    rate(request_duration_seconds_bucket[5m])
+)
+```
+
+rate 对每个 bucket 每条序列独立计算，quantile 得到每实例的 P80。
+
+**全服务的 P80（常用）**
+
+```promql
+histogram_quantile(0.80,
+    sum(rate(request_duration_seconds_bucket[5m])) by (le)
+)
+```
+
+先 rate，按 le 聚合所有实例的 bucket，重建整体分布并求 p80。
+
+---
+
+> **PromQL 的核心：先计算 rate/increase/histogram_quantile → 再按 label 进行聚合**
+
+---
 
 ### 可视化与告警 Grafana、Alertmanager
 
+Grafana 是常用的可视化工具，支持多种数据源（Prometheus、InfluxDB、Elasticsearch 等）。通过 Grafana，可以创建丰富的 Dashboard，展示各种监控指标与图表。
+
+Alertmanager 负责处理 Prometheus 触发的告警，支持告警抑制、分组与路由，并可通过邮件、Slack、钉钉等多种方式发送通知。
 
 ## Prometheus 实践指南
 
-TODO： 简化流程并实践
-
-下面把常见的安装、接入、PromQL 示例、告警、服务发现、安全与运维建议放在同一节，便于阅读与实践。
+参考阅读：[Prometheus 快速入门教程](https://yunlzheng.gitbook.io/prometheus-book/parti-prometheus-ji-chu/quickstart/prometheus-quick-start)
 
 
-### 安装与快速上手
+## TODO
 
-常见部署方式：
-
-- 本地二进制（学习/单机）：下载官方 release，运行 `./prometheus --config.file=prometheus.yml`；
-- Docker：
-
-```bash
-docker run -p 9090:9090 \
-    -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
-    prom/prometheus:latest
-```
-
-- Kubernetes：使用 Helm Chart（如 `kube-prometheus-stack`）或 Operator 部署完整监控栈。
-
-
-示例 `prometheus.yml`（最简单的 scrape 配置）：
-
-```yaml
-global:
-    scrape_interval: 15s
-
-scrape_configs:
-    - job_name: 'prometheus'
-        static_configs:
-            - targets: ['localhost:9090']
-
-    - job_name: 'node'
-        static_configs:
-            - targets: ['host1:9100', 'host2:9100']
-```
-
-
-### 应用接入示例（Go）
-
-最小 Go 示例（使用 `client_golang`）暴露指标：
-
-```go
-package main
-
-import (
-        "net/http"
-        "time"
-        "github.com/prometheus/client_golang/prometheus"
-        "github.com/prometheus/client_golang/prometheus/promhttp"
-)
-
-var (
-        reqs = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "http_requests_total"}, []string{"path", "method", "code"})
-        latency = prometheus.NewHistogram(prometheus.HistogramOpts{Name: "http_request_duration_seconds", Buckets: prometheus.DefBuckets})
-)
-
-func init() { prometheus.MustRegister(reqs, latency) }
-
-func main() {
-        http.Handle("/metrics", promhttp.Handler())
-        // your handlers...
-        http.ListenAndServe(":8080", nil)
-}
-```
-
-启动后，Prometheus 抓取 `http://<host>:8080/metrics` 即可采集指标。
-
-
-### 服务发现与 relabeling
-
-在动态环境中（例如 Kubernetes），Prometheus 支持多种服务发现方式（`kubernetes_sd_configs`, `consul_sd_configs`, `file_sd_configs` 等），并通过 `relabel_configs` 在抓取前对目标或 labels 做过滤、替换或删除：
-
-示例（Kubernetes）：
-
-```yaml
-scrape_configs:
-    - job_name: 'kubernetes-pods'
-        kubernetes_sd_configs:
-            - role: pod
-        relabel_configs:
-            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-                action: keep
-                regex: true
-            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-                target_label: __metrics_path__
-```
-
-
-### PromQL 常用示例
-
-- 计算 5 分钟内每秒请求速率（QPS）：
-
-```promql
-sum(rate(http_requests_total[5m]))
-```
-
-- 计算 95 百分位响应时间（基于 histogram）：
-
-```promql
-histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
-```
-
-- 某实例 CPU 使用率（node_exporter）：
-
-```promql
-(1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100
-```
-
-使用 recording rules 把复杂或开销大的查询提前计算为新的 time series，可以显著提升查询性能。
-
-
-### 告警规则与 Alertmanager
-
-示例告警规则：
-
-```yaml
-groups:
-- name: example
-    rules:
-    - alert: HighRequestLatency
-        expr: histogram_quantile(0.9, sum by (le)(rate(http_request_duration_seconds_bucket[5m]))) > 0.5
-        for: 2m
-        labels:
-            severity: page
-        annotations:
-            summary: "高请求延迟 (实例 {{ $labels.instance }})"
-```
-
-Prometheus 将触发的告警发送到 Alertmanager，Alertmanager 负责抑制、分组、路由及通知（邮件/Slack/钉钉等）。
-
-
-### PushGateway（短期作业）
-
-对于短期批处理作业，PushGateway 可用于推送指标：
-
-```bash
-echo "my_job_metric 42" | curl --data-binary @- http://pushgateway:9091/metrics/job/my_job
-```
-
-注意：PushGateway 保存的是最新值，不适合作为所有长期指标的替代方案。
-
-
-### 安全与访问控制
-
-- 指标端点应放在受限网络或通过反向代理（带认证与 TLS）暴露；
-- `prometheus.yml` 支持 `basic_auth`、`tls_config`：
-
-```yaml
-scrape_configs:
-    - job_name: secure_app
-        static_configs:
-            - targets: ['10.0.0.5:9100']
-        basic_auth:
-            username: prometheus
-            password: s3cr3t
-        tls_config:
-            ca_file: /etc/prometheus/ca.crt
-```
-
-
-### 长期存储与扩展
-
-当需要长期保存指标或跨集群聚合查询时，可采用 Thanos 或 Cortex：
-
-- Thanos：通过 sidecar 上传本地块到对象存储并提供全局查询层；
-- Cortex：采用可扩展后端进行写入与查询，适合多租户场景。
-
-
-### 可视化与调优建议
-
-- 使用 Grafana 导入现有 Dashboard 或自定义面板；常用 PromQL 如 `sum(rate(http_requests_total[5m])) by (job)`。
-- 排错流程：先访问目标 `/metrics` 检查输出 -> Prometheus UI `Status -> Targets` 查看抓取错误 -> 使用 `promtool check config` 验证配置。
-- 控制 label 基数，使用 recording rules、合理安排 `scrape_interval` 来减轻查询与抓取负载。
-
-
-## 更细化技术细节
-
-### 几种不同的计数器的区别
-
-### 时序数据库的存储与查询
-
-### 常用的promQL查询
+ - [ ] Prometheus 时序数据库的设计与实现细节
 
 
 ## 参考与延申阅读
 
-- 官方文档：https://prometheus.io/docs/
-- PromQL 教程：https://prometheus.io/docs/prometheus/latest/querying/basics/
+- 官方文档：[https://prometheus.io/docs/](https://prometheus.io/docs/)
+- PromQL 教程：[https://prometheus.io/docs/prometheus/latest/querying/basics/](https://prometheus.io/docs/prometheus/latest/querying/basics/)
 - Thanos / Cortex：长期存储与扩展方案
+- Prometheus-book：[https://yunlzheng.gitbook.io/prometheus-book](https://yunlzheng.gitbook.io/prometheus-book)
+- Prometheus TSDB 的设计与实现：[https://tech.qimao.com/prometheus-tsdb-de-she-ji-yu-shi-xian-2/](https://tech.qimao.com/prometheus-tsdb-de-she-ji-yu-shi-xian-2/)
 
 
